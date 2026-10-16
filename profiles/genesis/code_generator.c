@@ -2629,6 +2629,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             int8_t d8 = (int8_t)(ext & 0xFF);
             const char *xr = xtype ? "g_cpu.A" : "g_cpu.D";
             uint32_t base = pc_addr + (int32_t)d8;
+            /* A popped return slot must reach the handler's RTS, as in
+             * emit_split_tail_call. */
+            const char *carry = *has_sp_adjust
+                ? "g_split_sp_popped += _sp_popped; _sp_popped = 0; " : "";
 
             uint32_t pc_targets[32];
             int npc = probe_pc_idx_targets(rom, instr, instrs, pc_targets,
@@ -2661,9 +2665,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                     seen_offsets[seen_count++] = off;
                     fprintf(f, "    case %d: goto label_%06X;\n", off, pc_targets[t]);
                 } }
-                fprintf(f, "    default: hybrid_jmp_interpret(0x%08Xu + "
+                fprintf(f, "    default: %shybrid_jmp_interpret(0x%08Xu + "
                         "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d])); return;\n",
-                        base, ext, xreg, xreg);
+                        carry, base, ext, xreg, xreg);
                 fprintf(f, "  }\n");
             } else if (not_ >= 1) {
                 /* Case (b): offset-table dispatch — `dc.w (target - base)`
@@ -2687,9 +2691,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                     fprintf(f, "    case %d: goto label_%06X;\n",
                             ot_offsets[t], ot_targets[t]);
                 } }
-                fprintf(f, "    default: hybrid_jmp_interpret(0x%08Xu + "
+                fprintf(f, "    default: %shybrid_jmp_interpret(0x%08Xu + "
                         "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d])); return;\n",
-                        base, ext, xreg, xreg);
+                        carry, base, ext, xreg, xreg);
                 fprintf(f, "  }\n");
             } else {
                 /* Case (c): nothing recognised — fall back to runtime dispatch. */
@@ -2698,9 +2702,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 fprintf(f, "  /* JMP table at $%06X: interpret handler at base $%06X + %s[%d] */\n",
                         instr->addr, base, xr + 6 /* skip "g_cpu." */, xreg);
                 emit_cycle_accounting(f, "  ", estimate_cycles(instr));
-                fprintf(f, "  hybrid_jmp_interpret(0x%08Xu + "
+                fprintf(f, "  %shybrid_jmp_interpret(0x%08Xu + "
                         "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]));\n",
-                        base, ext, xreg, xreg);
+                        carry, base, ext, xreg, xreg);
                 fprintf(f, "  return;\n");
             }
         } else {
