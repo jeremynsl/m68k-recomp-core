@@ -2344,6 +2344,17 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
 
     /* ------------------------------------------------------------------ */
     case MN_RTS:
+        /* One long pushed over the return slot (`pea x` or `move.l An,-(sp)`
+         * before `rts`): the guest jumps to it, so pop it and tail-call it
+         * like JMP (An). Its own RTS then returns through our JSR site. */
+        if (*has_sp_adjust) {
+            fprintf(f, "  if (g_cpu.A[7] == _slot_sp - 4u) {\n");
+            fprintf(f, "    uint32_t _rts_target = m68k_read32(g_cpu.A[7]) & 0xFFFFFFu;\n");
+            fprintf(f, "    g_cpu.A[7] += 4; _sp_popped = 0;\n");
+            emit_split_tail_call_expr(f, "    ", "_rts_target", true,
+                                      estimate_cycles(instr));
+            fprintf(f, "  }\n");
+        }
         /* A stack skip can discard MORE than one return slot (SMPS's
          * stop-track command uses addq.w #8,sp). Carry the complete count
          * through the C callers; a boolean loses the second unwind and
@@ -4926,6 +4937,10 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                     has_sp_adjust = 1;
                     break;
                 }
+                if (pre.mnemonic == MN_PEA) {
+                    has_sp_adjust = 1;
+                    break;
+                }
                 if (pre.size == M68K_SIZE_L && pre.mnemonic == MN_MOVEM) {
                     int dir = (pre.words[0] >> 10) & 1;
                     int mode = (pre.src_ea >> 3) & 7;
@@ -4946,6 +4961,9 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * MOVEM/ADDQ adjustment changes it. */
             fprintf(f_func, "  int _sp_popped = g_split_sp_popped;\n");
             fprintf(f_func, "  g_split_sp_popped = 0;\n");
+            /* Address of this 68K path's return slot. */
+            fprintf(f_func, "  uint32_t _slot_sp = g_cpu.A[7] - 4u * (uint32_t)_sp_popped;\n");
+            fprintf(f_func, "  (void)_slot_sp;\n");
         }
 
         /* TEMPORARY debug counters for VBla chain tracing */
