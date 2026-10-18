@@ -30,6 +30,30 @@
 static uint32_t s_work_stack[WORK_STACK_SIZE];
 static int      s_work_top = 0;
 
+/* OS-9's compiler calls distant PIC functions with an immediate register
+ * offset followed immediately by JSR (d8,PC,Xn). Prove only the adjacent
+ * load on this decoded path; preserve dynamic instruction semantics. */
+static bool constant_index_target(const M68KInstr *load, const M68KInstr *call,
+                                   uint32_t *target) {
+    if ((call->mnemonic!=MN_JSR && call->mnemonic!=MN_JMP) ||
+        call->src_ea!=((EA_PCR<<3)|PCR_PC_IDX) || call->word_count!=2 ||
+        load->addr+load->byte_length!=call->addr) return false;
+    uint16_t ext=call->words[1];
+    if (ext&0x0700) return false; /* 68020 scale/full extensions */
+    unsigned reg=(ext>>12)&7, bank=(ext>>15)&1;
+    uint32_t value;
+    if (load->mnemonic==MN_MOVEQ && !bank && load->reg==(int)reg) value=load->imm32;
+    else if ((load->mnemonic==MN_MOVE || load->mnemonic==MN_MOVEA) &&
+             load->src_ea==((EA_PCR<<3)|PCR_IMM) &&
+             load->dst_ea==(int)((bank<<3)|reg) && load->size==M68K_SIZE_L &&
+             load->word_count==3)
+        value=((uint32_t)load->words[1]<<16)|load->words[2];
+    else return false;
+    if (!(ext&0x0800)) value=(uint32_t)(int32_t)(int16_t)value;
+    *target=call->addr+2+(uint32_t)(int32_t)(int8_t)ext+value;
+    return true;
+}
+
 /* Address-space cap for discovery bookkeeping. Genesis ROMs occupy 0..0x3FFFFF;
  * the CD-i system ROM is mapped at $400000, so we size for up to $7FFFFF. This
  * is a strict generalisation of the Genesis-only 0x400000 cap (Genesis ROMs are
@@ -264,7 +288,8 @@ static void add_function(FunctionList *list, uint32_t addr) {
     push_addr(addr);
 }
 
-void function_finder_run(const GenesisRom *rom, FunctionList *list, const GameConfig *cfg) {
+static void function_finder_run_impl(const GenesisRom *rom, FunctionList *list,
+                                     const GameConfig *cfg, bool module) {
     s_ff_cfg = cfg;
     memset(addr_seen, 0, sizeof(addr_seen));
     s_work_top = 0;
@@ -283,11 +308,11 @@ void function_finder_run(const GenesisRom *rom, FunctionList *list, const GameCo
 
     /* Seed from vector table at $000000 */
     /* Offset 4 = initial PC (RESET handler) */
-    add_function(list, rom_read32(rom, 4) & 0xFFFFFF);
+    if (!module) add_function(list, rom_read32(rom, 4) & 0xFFFFFF);
 
     /* Common interrupt vectors (68K vector table at $000000) */
     /* Bus error=$8, Address error=$C, Illegal=$10 ... H-blank=$70, V-blank=$78 */
-    for (int vec = 2; vec < 64; vec++) {
+    for (int vec = 2; !module && vec < 64; vec++) {
         uint32_t handler = rom_read32(rom, (uint32_t)vec * 4) & 0xFFFFFF;
         if (handler != 0 && handler != 0xFFFFFF && handler < rom->rom_size)
             add_function(list, handler);
@@ -304,6 +329,8 @@ void function_finder_run(const GenesisRom *rom, FunctionList *list, const GameCo
     while (s_work_top > 0) {
         uint32_t func_start = s_work_stack[--s_work_top];
         uint32_t pc = func_start;
+        M68KInstr previous={0};
+        bool have_previous=false;
 
         while (pc < rom->rom_size) {
             M68KInstr instr;
@@ -327,6 +354,11 @@ void function_finder_run(const GenesisRom *rom, FunctionList *list, const GameCo
                     && !game_config_is_blacklisted(cfg, instr.target_addr)) {
                 add_function(list, instr.target_addr);
             }
+            uint32_t constant_target;
+            if (have_previous && constant_index_target(&previous,&instr,&constant_target) &&
+                constant_target<rom->rom_size && !(constant_target&1) &&
+                !game_config_is_blacklisted(cfg,constant_target))
+                add_function(list,constant_target);
 
             /* Follow conditional branches (both paths) */
             if ((instr.mnemonic == MN_Bcc || instr.mnemonic == MN_DBcc)
@@ -448,6 +480,7 @@ void function_finder_run(const GenesisRom *rom, FunctionList *list, const GameCo
             /* Terminator */
             if (m68k_is_terminator(&instr)) break;
 
+            previous=instr;have_previous=true;
             pc += instr.byte_length;
         }
     }
@@ -495,6 +528,14 @@ void function_finder_run(const GenesisRom *rom, FunctionList *list, const GameCo
                     log_path);
         }
     }
+}
+
+void function_finder_run(const GenesisRom *rom, FunctionList *list, const GameConfig *cfg) {
+    function_finder_run_impl(rom, list, cfg, false);
+}
+
+void function_finder_run_module(const GenesisRom *rom, FunctionList *list, const GameConfig *cfg) {
+    function_finder_run_impl(rom, list, cfg, true);
 }
 
 void function_list_free(FunctionList *list) {

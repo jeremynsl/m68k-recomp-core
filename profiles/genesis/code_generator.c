@@ -2361,10 +2361,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * resumes code the guest deliberately skipped. Tail edges do not
          * consume this count; each actual JSR/BSR caller consumes one. */
         if (*has_sp_adjust) {
-            fprintf(f, "  if (_sp_popped > 0) { g_rte_pending = _sp_popped; _sp_popped = 0; }\n");
-            fprintf(f, "  else if (g_split_sp_popped > 0) { g_rte_pending = g_split_sp_popped; g_split_sp_popped = 0; }\n");
+            fprintf(f, "  if (_sp_popped >= 4) { g_rte_pending = _sp_popped / 4; _sp_popped = 0; }\n");
+            fprintf(f, "  else if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
         } else {
-            fprintf(f, "  if (g_split_sp_popped > 0) { g_rte_pending = g_split_sp_popped; g_split_sp_popped = 0; }\n");
+            fprintf(f, "  if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
         }
         emit_cycle_accounting(f, "  ", estimate_cycles(instr));
         fprintf(f, "  return;\n");
@@ -2942,11 +2942,14 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             /* Update N,Z; clear V,C */
             emit_flags_logic(f, src_expr, sz);
         }
-        if (*has_sp_adjust && sz == M68K_SIZE_L) {
+        if (*has_sp_adjust) {
+            /* A7 advances by two even for a byte operand. Track bytes so
+             * two word data pushes balance one longword data pop. */
+            int stack_bytes = sz == M68K_SIZE_L ? 4 : 2;
             if (src_ea == ((EA_An_POST << 3) | 7))
-                fprintf(f, "  _sp_popped += 1; /* MOVE.L (SP)+ */\n");
+                fprintf(f, "  _sp_popped += %d; /* MOVE (SP)+ bytes */\n", stack_bytes);
             if (dst_ea == ((EA_An_PRE << 3) | 7))
-                fprintf(f, "  _sp_popped -= 1; /* MOVE.L -(SP) */\n");
+                fprintf(f, "  _sp_popped -= %d; /* MOVE -(SP) bytes */\n", stack_bytes);
         }
         break;
     }
@@ -2961,9 +2964,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         } else {
             fprintf(f, "  g_cpu.A[%d] = (uint32_t)(%s);\n", areg, src_expr);
         }
-        if (*has_sp_adjust && sz == M68K_SIZE_L
+        if (*has_sp_adjust
                 && instr->src_ea == ((EA_An_POST << 3) | 7))
-            fprintf(f, "  _sp_popped += 1; /* MOVEA.L (SP)+ */\n");
+            fprintf(f, "  _sp_popped += %d; /* MOVEA (SP)+ bytes */\n",
+                    sz == M68K_SIZE_L ? 4 : 2);
         break;
     }
 
@@ -2980,7 +2984,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         emit_ea_addr(f, instr, instr->src_ea, &er, addr_expr);
         fprintf(f, "  g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], %s);\n", addr_expr);
         if (*has_sp_adjust)
-            fprintf(f, "  _sp_popped -= 1; /* PEA pushes one longword */\n");
+            fprintf(f, "  _sp_popped -= 4; /* PEA pushes one longword */\n");
         break;
     }
 
@@ -3011,13 +3015,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         if (mode == 1) {
             /* ADDQ to An: no flags */
             fprintf(f, "  g_cpu.A[%d] += %uu;\n", reg, imm);
-            /* Detect early-exit pattern: addq.l #N,sp where N is a multiple of 4.
-             * This discards return address(es) from the 68K stack.  The subsequent
-             * RTS will return to the caller's caller.  Set a function-local flag
-             * so this function's RTS sites propagate the return. */
-            if (reg == 7 && (imm % 4) == 0 && imm > 0) {
-                *has_sp_adjust = 1;
-                fprintf(f, "  _sp_popped += %u;\n", imm / 4);
+            /* Account data releases as well as whole return-slot skips. */
+            if (reg == 7 && imm > 0 && *has_sp_adjust) {
+                fprintf(f, "  _sp_popped += %u;\n", imm);
             }
         } else {
             /* RMW: use emit_ea_load_ex with rmw=1 so (An)+ doesn't
@@ -3073,8 +3073,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             fprintf(f, "  g_cpu.A[%d] -= %uu;\n", reg, imm);
             /* Reverse of the ADDQ early-exit pattern: pushing onto the stack
              * cancels a pending early return level. */
-            if (reg == 7 && (imm % 4) == 0 && imm > 0 && *has_sp_adjust) {
-                fprintf(f, "  if (_sp_popped > 0) _sp_popped -= %u;\n", imm / 4);
+            if (reg == 7 && imm > 0 && *has_sp_adjust) {
+                fprintf(f, "  _sp_popped -= %u;\n", imm);
             }
         } else {
             /* RMW: suppress (An)+ increment on read */
@@ -3940,17 +3940,17 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             else
                 fprintf(f, "  }\n");
         }
-        if (*has_sp_adjust && sz == M68K_SIZE_L && reg == 7) {
+        if (*has_sp_adjust && reg == 7) {
             int reg_count = 0;
             for (int bit = 0; bit < 16; bit++)
                 if (mask & (1u << bit))
                     reg_count++;
             if (dir == 1 && mode == 3)
-                fprintf(f, "  _sp_popped += %d; /* MOVEM.L (SP)+ */\n",
-                        reg_count);
+                fprintf(f, "  _sp_popped += %d; /* MOVEM (SP)+ bytes */\n",
+                        reg_count * (sz == M68K_SIZE_L ? 4 : 2));
             else if (dir == 0 && mode == 4)
-                fprintf(f, "  _sp_popped -= %d; /* MOVEM.L -(SP) */\n",
-                        reg_count);
+                fprintf(f, "  _sp_popped -= %d; /* MOVEM -(SP) bytes */\n",
+                        reg_count * (sz == M68K_SIZE_L ? 4 : 2));
         }
         break;
     }
@@ -4626,7 +4626,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             fprintf(f_parts[k],
                 "/* The one file-scope definition for the extern declared in\n"
                 " * %s_decls.h — every other split TU links against this. */\n"
-                "int g_split_sp_popped = 0;\n\n", prefix);
+                "int g_split_sp_popped = 0; /* signed guest stack delta in bytes */\n\n", prefix);
         }
     }
 
@@ -4914,8 +4914,8 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             }
         }
 
-        /* Pre-scan for instructions that can change A7 by whole longwords.
-         * `_sp_popped` tracks the path-local net delta.  Besides explicit
+        /* Pre-scan for explicit stack operands of every width.
+         * `_sp_popped` tracks the path-local net delta in BYTES. Besides explicit
          * ADDQ stack skips, this must include MOVE/MOVEM postincrement pops:
          * a helper may consume its JSR return slot on only one branch, which
          * cannot be classified as either an ordinary or an unconditional
@@ -4924,19 +4924,18 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         for (int j = 0; j < instrs.count; j++) {
             M68KInstr pre;
             if (m68k_decode(rom, instrs.addrs[j], &pre)) {
-                if ((pre.mnemonic == MN_ADDQ || pre.mnemonic == MN_ADDA) &&
+                if ((pre.mnemonic == MN_ADDQ || pre.mnemonic == MN_SUBQ) &&
                     ((pre.src_ea >> 3) & 7) == 1 && (pre.src_ea & 7) == 7 &&
-                    pre.size == M68K_SIZE_L && (pre.imm32 % 4) == 0 && pre.imm32 > 0) {
+                    pre.imm32 > 0) {
                     has_sp_adjust = 1;
                     break;
                 }
-                if (pre.size == M68K_SIZE_L
-                        && (pre.mnemonic == MN_MOVE || pre.mnemonic == MN_MOVEA)
+                if ((pre.mnemonic == MN_MOVE || pre.mnemonic == MN_MOVEA)
                         && pre.src_ea == ((EA_An_POST << 3) | 7)) {
                     has_sp_adjust = 1;
                     break;
                 }
-                if (pre.size == M68K_SIZE_L && pre.mnemonic == MN_MOVE
+                if (pre.mnemonic == MN_MOVE
                         && pre.dst_ea == ((EA_An_PRE << 3) | 7)) {
                     has_sp_adjust = 1;
                     break;
@@ -4945,7 +4944,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                     has_sp_adjust = 1;
                     break;
                 }
-                if (pre.size == M68K_SIZE_L && pre.mnemonic == MN_MOVEM) {
+                if (pre.mnemonic == MN_MOVEM) {
                     int dir = (pre.words[0] >> 10) & 1;
                     int mode = (pre.src_ea >> 3) & 7;
                     int reg = pre.src_ea & 7;
@@ -4966,7 +4965,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             fprintf(f_func, "  int _sp_popped = g_split_sp_popped;\n");
             fprintf(f_func, "  g_split_sp_popped = 0;\n");
             /* Address of this 68K path's return slot. */
-            fprintf(f_func, "  uint32_t _slot_sp = g_cpu.A[7] - 4u * (uint32_t)_sp_popped;\n");
+            fprintf(f_func, "  uint32_t _slot_sp = g_cpu.A[7] - (uint32_t)_sp_popped;\n");
             fprintf(f_func, "  (void)_slot_sp;\n");
         }
 

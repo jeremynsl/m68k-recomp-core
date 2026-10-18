@@ -17,4 +17,7 @@ typedef struct {
 } FunctionList;
 
 void function_finder_run(const GenesisRom *rom, FunctionList *list, const GameConfig *cfg);
+/* Relocatable modules have declared entries, not a reset/vector table. Uses
+ * cfg extra functions as seeds and otherwise shares normal CFG discovery. */
+void function_finder_run_module(const GenesisRom *rom, FunctionList *list, const GameConfig *cfg);
 void function_list_free(FunctionList *list);

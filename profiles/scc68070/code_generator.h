@@ -18,6 +18,16 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                   const AnnotationTable *at, const GameConfig *cfg,
                   bool reverse_debug);
 
+/* Emit a position-independent module. Guest PCs, relative EAs and return
+ * addresses are rebased by the runtime-supplied load address. Absolute EAs
+ * remain absolute. symbol is a unique C identifier. cfg must enable async
+ * resume entries. The module exports symbol_has_offset and symbol_dispatch;
+ * it does not define the process-wide BIOS dispatcher. */
+bool codegen_emit_module(const GenesisRom *rom, const FunctionList *funcs,
+                         const char *out_full_path, const char *out_dispatch_path,
+                         const AnnotationTable *at, const GameConfig *cfg,
+                         const char *symbol);
+
 /* Diagnostic: if set before codegen_emit, the final post-boundary-split
  * function-entry set is written (one hex addr per line) to `path`. Used by
  * the heuristic-coverage exercise (diff disasm-seeded vs pure-heuristic runs

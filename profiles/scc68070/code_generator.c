@@ -28,6 +28,15 @@
 static const char      *s_diag_func_name = NULL;
 static uint32_t         s_diag_func_addr = 0;
 static const M68KInstr *s_diag_instr     = NULL;
+static const char *s_module_symbol;
+static const char *s_pc_prefix = "";
+
+static const char *target_prefix(const M68KInstr *instr) {
+    int ea = instr->src_ea;
+    return instr->mnemonic == MN_JSR || instr->mnemonic == MN_JMP
+         ? (((ea >> 3) == 7 && (ea & 7) >= 2) ? s_pc_prefix : "")
+         : s_pc_prefix;
+}
 
 /* =========================================================================
  * AddrSet — simple sorted dynamic array of uint32_t addresses
@@ -466,7 +475,7 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
             uint16_t ext = er_next(er);
             int16_t  d16 = (int16_t)ext;
             uint32_t eff = (uint32_t)((int32_t)pc_addr + (int32_t)d16);
-            fprintf(f, "  %s %s = %s(0x%08X);\n", ct, tmp, rf, eff);
+            fprintf(f, "  %s %s = %s(%s0x%08X);\n", ct, tmp, rf, s_pc_prefix, eff);
             snprintf(out_expr, 256, "%s", tmp);
             break;
         }
@@ -475,8 +484,8 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
             uint16_t ext = er_next(er);
             int8_t   d8    = (int8_t)(ext & 0xFF);
             char     idx[40]; fmt_brief_index(idx, sizeof idx, ext);
-            fprintf(f, "  %s %s = %s((uint32_t)(0x%08X + %s + (%d)));\n",
-                    ct, tmp, rf, pc_addr, idx, (int)d8);
+            fprintf(f, "  %s %s = %s((uint32_t)(%s0x%08X + %s + (%d)));\n",
+                    ct, tmp, rf, s_pc_prefix, pc_addr, idx, (int)d8);
             snprintf(out_expr, 256, "%s", tmp);
             break;
         }
@@ -557,7 +566,7 @@ static void emit_ea_addr_ex(FILE *f, const M68KInstr *instr, int ea,
             uint16_t ext = er_next(er);
             int16_t d16 = (int16_t)ext;
             uint32_t eff = (uint32_t)((int32_t)pc_addr + (int32_t)d16);
-            snprintf(out_expr, 256, "0x%08Xu", eff);
+            snprintf(out_expr, 256, "%s0x%08Xu", s_pc_prefix, eff);
             break;
         }
         case 3: {
@@ -567,9 +576,9 @@ static void emit_ea_addr_ex(FILE *f, const M68KInstr *instr, int ea,
             char   idx[40]; fmt_brief_index(idx, sizeof idx, ext);
             snprintf(out_expr, 256,
                      u_suffix
-                       ? "(uint32_t)(0x%08Xu + %s + (%d))"
-                       : "(uint32_t)(0x%08X + %s + (%d))",
-                     pc_addr, idx, (int)d8);
+                       ? "(uint32_t)(%s0x%08Xu + %s + (%d))"
+                       : "(uint32_t)(%s0x%08X + %s + (%d))",
+                     s_pc_prefix, pc_addr, idx, (int)d8);
             break;
         }
         default:
@@ -1029,11 +1038,11 @@ static void emit_split_tail_call(FILE *f, const char *indent,
     emit_cycle_accounting(f, indent, cycles_before);
     if (carry_sp_adjust) {
         fprintf(f, "%s{ g_split_sp_popped += _sp_popped; _sp_popped = 0;\n", indent);
-        fprintf(f, "%s  recomp_tail_call(0x%06Xu);\n", indent, target_addr);
+        fprintf(f, "%s  recomp_tail_call(%s0x%06Xu);\n", indent, s_pc_prefix, target_addr);
         fprintf(f, "%s  return;\n", indent);
         fprintf(f, "%s}\n", indent);
     } else {
-        fprintf(f, "%srecomp_tail_call(0x%06Xu); return;\n", indent, target_addr);
+        fprintf(f, "%srecomp_tail_call(%s0x%06Xu); return;\n", indent, s_pc_prefix, target_addr);
     }
 }
 
@@ -2372,8 +2381,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * trace remains labeled with the STOP opcode while parked, but an interrupt frame
          * stacks addr+length; leaving g_cpu.PC at the opcode re-executes STOP
          * after every wake. */
-        fprintf(f, "  g_cpu.PC = 0x%06Xu; /* post-STOP interrupt resume */\n",
-                instr->addr + instr->byte_length);
+        fprintf(f, "  g_cpu.PC = %s0x%06Xu; /* post-STOP interrupt resume */\n",
+                s_pc_prefix, instr->addr + instr->byte_length);
         fprintf(f, "  genesis_stop_until_interrupt((uint16_t)0x%04Xu);\n",
                 (unsigned)(instr->imm32 & 0xFFFFu));
         emit_cycle_accounting(f, "  ", estimate_cycles(instr));
@@ -2396,7 +2405,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * cost so the first handler instruction drains it. */
         fprintf(f, "  g_native_insn_count++; runtime_defer_exception_cycles(%d);\n",
                 estimate_cycles(instr));
-        fprintf(f, "  g_cpu.PC = 0x%06Xu;\n", instr->addr + instr->byte_length);
+        fprintf(f, "  g_cpu.PC = %s0x%06Xu;\n", s_pc_prefix, instr->addr + instr->byte_length);
         fprintf(f, "  m68k_trap_vector(0x%02Xu); return;\n",
                 0x20u + (unsigned)(instr->imm32 & 0xF));
         *skip_until_label = true;
@@ -2442,8 +2451,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ILLEGAL:
         /* 0x4AFC, A-line, F-line — runtime picks the right vector. */
         emit_cycle_accounting(f, "  ", estimate_cycles(instr));
-        fprintf(f, "  m68k_illegal_trap(0x%06Xu, 0x%04Xu); return;\n",
-                addr, (unsigned)instr->words[0]);
+        fprintf(f, "  m68k_illegal_trap(%s0x%06Xu, 0x%04Xu); return;\n",
+                s_pc_prefix, addr, (unsigned)instr->words[0]);
         *skip_until_label = true;
         break;
 
@@ -2456,7 +2465,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         uint32_t ret_addr = instr->addr + instr->byte_length;
 
         /* Simulate JSR/BSR stack: push return address onto the 68K stack. */
-        fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push */\n", ret_addr);
+        fprintf(f, "  recomp_push_return(%s0x%06Xu); /* JSR push */\n", s_pc_prefix, ret_addr);
         /* The call instruction retires BEFORE the target's first instruction.
          * Charge it at that architectural boundary, not after the native C
          * callee returns. Deferring this charge freezes every cycle-driven
@@ -2467,11 +2476,12 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
 
         if (instr->has_target) {
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
-            if (func_is_known(instr->target_addr))
+            if (func_is_known(instr->target_addr) &&
+                (!s_module_symbol || target_prefix(instr)[0]))
                 fprintf(f, "    recomp_call_func(func_%06X);\n", instr->target_addr);
             else
-                fprintf(f, "    recomp_call_addr(0x%06Xu); /* JSR target not in func table */\n",
-                        instr->target_addr);
+                fprintf(f, "    recomp_call_addr(%s0x%06Xu); /* JSR target not in func table */\n",
+                        target_prefix(instr), instr->target_addr);
             fprintf(f, "    g_split_sp_popped = _saved_split_sp_popped;\n");
             fprintf(f, "  }\n");
         } else if (mode == 2 || mode == 5 || mode == 6 ||
@@ -2536,7 +2546,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * continuation (== the return the hybrid stopped at) with NO pop. */
         fprintf(f, "  if (!g_call_was_hybrid) {\n");
         fprintf(f, "    uint32_t _ret = m68k_read32(g_cpu.A[7]); g_cpu.A[7] += 4; /* JSR pop (flat-call callee) */\n");
-        fprintf(f, "    if ((_ret & 0xFFFFFFu) != 0x%06Xu) {\n", ret_addr & 0xFFFFFFu);
+        fprintf(f, "    if ((_ret & 0xFFFFFFu) != (%s0x%06Xu)) {\n",
+                s_pc_prefix, ret_addr & 0xFFFFFFu);
         fprintf(f, "      g_redirect_addr = _ret & 0xFFFFFFu; g_redirect_pending = 1; return;\n");
         fprintf(f, "    }\n");
         fprintf(f, "  }\n");
@@ -2559,10 +2570,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
              * are the ODD TARGET, not this JMP — the fault is the fetch from the
              * odd address. The OS-9 handler reads both fields, so set PC to the target
              * before the trap or the kernel resumes at the wrong place. */
-            fprintf(f, "  g_cpu.PC = 0x%06Xu; /* odd target = stacked PC (post-fetch) */\n",
-                    instr->target_addr);
-            fprintf(f, "  g_fault_addr = 0x%06Xu; /* TPF = faulting address = odd target */\n",
-                    instr->target_addr);
+            fprintf(f, "  g_cpu.PC = %s0x%06Xu; /* odd target = stacked PC (post-fetch) */\n",
+                    target_prefix(instr), instr->target_addr);
+            fprintf(f, "  g_fault_addr = %s0x%06Xu; /* TPF = faulting address = odd target */\n",
+                    target_prefix(instr), instr->target_addr);
             /* Record the faulting fetch as its own trace sample so the trace
              * aligns with the oracle (which steps onto the odd PC, then faults);
              * otherwise the recompiled trap is off-by-one vs the interpreter
@@ -2577,7 +2588,12 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         if (instr->has_target) {
             audit_record(instr->addr, func_addr, instr->target_addr,
                          JMPAUDIT_STATIC_TARGET, 0);
-            if (addrset_contains(instrs, instr->target_addr)) {
+            if (s_module_symbol && !target_prefix(instr)[0]) {
+                char absolute[32];
+                snprintf(absolute, sizeof absolute, "0x%06Xu", instr->target_addr);
+                emit_split_tail_call_expr(f, "  ", absolute, *has_sp_adjust != 0,
+                                          estimate_cycles(instr));
+            } else if (addrset_contains(instrs, instr->target_addr)) {
                 emit_cycle_accounting(f, "  ", estimate_cycles(instr));
                 fprintf(f, "  goto label_%06X;\n", instr->target_addr);
             } else {
@@ -2608,6 +2624,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             int xtype = (ext >> 15) & 1;
             int8_t d8 = (int8_t)(ext & 0xFF);
             const char *xr = xtype ? "g_cpu.A" : "g_cpu.D";
+            const char *index_type = (ext & 0x0800u) ? "int32_t" : "int16_t";
             uint32_t base = pc_addr + (int32_t)d8;
 
             uint32_t pc_targets[32];
@@ -2630,7 +2647,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 fprintf(f, "  /* JMP table at $%06X: in-function dispatch — base $%06X + %s[%d], %d targets (Duff's device) */\n",
                         instr->addr, base, xr + 6 /* skip "g_cpu." */, xreg, npc);
                 emit_cycle_accounting(f, "  ", estimate_cycles(instr));
-                fprintf(f, "  switch ((int16_t)%s[%d]) {\n", xr, xreg);
+                fprintf(f, "  switch ((%s)%s[%d]) {\n", index_type, xr, xreg);
                 { int32_t seen_offsets[512]; int seen_count = 0;
                   for (int t = 0; t < npc; t++) {
                     int32_t off = (int32_t)(pc_targets[t] - base);
@@ -2640,8 +2657,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                     seen_offsets[seen_count++] = off;
                     fprintf(f, "    case %d: goto label_%06X;\n", off, pc_targets[t]);
                 } }
-                fprintf(f, "    default: hybrid_jmp_interpret(0x%08Xu + (uint32_t)(int16_t)%s[%d]); return;\n",
-                        base, xr, xreg);
+                fprintf(f, "    default: hybrid_jmp_interpret(%s0x%08Xu + (uint32_t)(%s)%s[%d]); return;\n",
+                        s_pc_prefix, base, index_type, xr, xreg);
                 fprintf(f, "  }\n");
             } else if (not_ >= 1) {
                 /* Case (b): offset-table dispatch — `dc.w (target - base)`
@@ -2654,7 +2671,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 fprintf(f, "  /* JMP table at $%06X: in-function dispatch — base $%06X + %s[%d], %d targets (offset table) */\n",
                         instr->addr, base, xr + 6 /* skip "g_cpu." */, xreg, not_);
                 emit_cycle_accounting(f, "  ", estimate_cycles(instr));
-                fprintf(f, "  switch ((int16_t)%s[%d]) {\n", xr, xreg);
+                fprintf(f, "  switch ((%s)%s[%d]) {\n", index_type, xr, xreg);
                 { int seen_offsets[512]; int seen_count = 0;
                   for (int t = 0; t < not_; t++) {
                     int dup = 0;
@@ -2664,8 +2681,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                     fprintf(f, "    case %d: goto label_%06X;\n",
                             ot_offsets[t], ot_targets[t]);
                 } }
-                fprintf(f, "    default: hybrid_jmp_interpret(0x%08Xu + (uint32_t)(int16_t)%s[%d]); return;\n",
-                        base, xr, xreg);
+                fprintf(f, "    default: hybrid_jmp_interpret(%s0x%08Xu + (uint32_t)(%s)%s[%d]); return;\n",
+                        s_pc_prefix, base, index_type, xr, xreg);
                 fprintf(f, "  }\n");
             } else {
                 /* Case (c): nothing recognised — fall back to runtime dispatch. */
@@ -2674,8 +2691,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 fprintf(f, "  /* JMP table at $%06X: interpret handler at base $%06X + %s[%d] */\n",
                         instr->addr, base, xr + 6 /* skip "g_cpu." */, xreg);
                 emit_cycle_accounting(f, "  ", estimate_cycles(instr));
-                fprintf(f, "  hybrid_jmp_interpret(0x%08Xu + (uint32_t)(int16_t)%s[%d]);\n",
-                        base, xr, xreg);
+                fprintf(f, "  hybrid_jmp_interpret(%s0x%08Xu + (uint32_t)(%s)%s[%d]);\n",
+                        s_pc_prefix, base, index_type, xr, xreg);
                 fprintf(f, "  return;\n");
             }
         } else {
@@ -3719,7 +3736,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 uint16_t ext = er_next(&er2);
                 int16_t d16 = (int16_t)ext;
                 uint32_t eff = (uint32_t)((int32_t)pc_addr + d16);
-                snprintf(base_expr, sizeof(base_expr), "0x%08Xu", eff);
+                snprintf(base_expr, sizeof(base_expr), "%s0x%08Xu", s_pc_prefix, eff);
                 break;
             }
             default:
@@ -4376,6 +4393,11 @@ static void emit_file_header(FILE *f) {
     fprintf(f, "/* AUTO-GENERATED by CdiRecomp. DO NOT EDIT. */\n");
     fprintf(f, "#include \"cdi_runtime.h\"\n");
     fprintf(f, "#include \"game_extras.h\"\n");
+    if (s_module_symbol) {
+        fprintf(f, "#include \"cdi_native.h\"\n");
+        fprintf(f, "extern uint32_t %s_base;\n", s_module_symbol);
+        fprintf(f, "int %s_dispatch(uint32_t,uint32_t);\n", s_module_symbol);
+    }
     if (s_reverse_debug) {
         /* Pull in the reverse-debugger API: g_rdb_current_func extern
          * (Tier 1) and rdb_on_block inline fast path (Tier 2). Header
@@ -4390,10 +4412,12 @@ static void emit_file_header(FILE *f) {
     fprintf(f, "\n");
 }
 
-bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
+static bool codegen_emit_impl(const GenesisRom *rom, const FunctionList *funcs,
                   const char *out_full_path, const char *out_dispatch_path,
                   const AnnotationTable *at, const GameConfig *cfg,
-                  bool reverse_debug) {
+                  bool reverse_debug, const char *module_symbol) {
+    s_module_symbol = module_symbol;
+    s_pc_prefix = module_symbol ? "_base + " : "";
     s_reverse_debug = reverse_debug;
     free(s_candidate_owners);
     s_candidate_owners = NULL;
@@ -4576,8 +4600,15 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     s_all_func_count = all_funcs.count;
 
     /* Forward declarations */
-    for (int i = 0; i < all_funcs.count; i++)
+    for (int i = 0; i < all_funcs.count; i++) {
+        if (s_module_symbol) {
+            fprintf(f_full, "#define func_%06X %s_func_%06X\n",
+                    all_funcs.addrs[i], s_module_symbol, all_funcs.addrs[i]);
+            fprintf(f_full, "#define func_resume_%06X %s_resume_%06X\n",
+                    all_funcs.addrs[i], s_module_symbol, all_funcs.addrs[i]);
+        }
         fprintf(f_full, "void func_%06X(void);\n", all_funcs.addrs[i]);
+    }
     fprintf(f_full, "\n");
 
     /* Emit each function body */
@@ -4691,6 +4722,10 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         } else {
             fprintf(f_full, "void func_%06X(void) {\n", func_addr);
         }
+        if (s_module_symbol) {
+            fprintf(f_full, "  const uint32_t _base = %s_base;\n", s_module_symbol);
+            fprintf(f_full, "  const uint64_t _native_token = cdi_native_execution_token(_base, %s_dispatch);\n", s_module_symbol);
+        }
         if (s_reverse_debug) {
             if (shared_body) {
                 fprintf(f_full, "  g_rdb_current_func = _entry;\n");
@@ -4725,11 +4760,11 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         }
 
         /* TEMPORARY debug counters for VBla chain tracing */
-        if (func_addr == 0x000B64)
+        if (!s_module_symbol && func_addr == 0x000B64)
             fprintf(f_full, "  g_dbg_b64_count++;\n");
-        else if (func_addr == 0x000B5E)
+        else if (!s_module_symbol && func_addr == 0x000B5E)
             fprintf(f_full, "  g_dbg_b5e_count++;\n");
-        else if (func_addr == 0x000B88)
+        else if (!s_module_symbol && func_addr == 0x000B88)
             fprintf(f_full, "  g_dbg_b88_count++;\n");
 
         /* VBlank yield override: emit yield call instead of normal body.
@@ -4876,7 +4911,11 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * dispatch misses, traps) and first-divergence analysis are useless
              * without an accurate PC — this one store per instruction is the
              * foundation of the runtime's observability (DEBUG.md). */
-            fprintf(f_full, "  g_cpu.PC = 0x%06Xu;\n", pc);
+            fprintf(f_full, "  g_cpu.PC = %s0x%06Xu;\n", s_pc_prefix, pc);
+            if (s_module_symbol)
+                fprintf(f_full, "  if (!cdi_native_instruction_valid(g_cpu.PC, %s_dispatch, _native_token)) {\n"
+                                "    g_redirect_addr = g_cpu.PC; g_redirect_pending = 1; return;\n"
+                                "  }\n", s_module_symbol);
             /* Always-on execution trace tap, at instruction ENTRY so every
              * instruction is sampled once, in order — JSR/BSR included, before
              * they transfer control (a hook at instruction END would miss them).
@@ -5020,6 +5059,36 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     fprintf(f_dispatch, "#include <stddef.h>\n");
     fprintf(f_dispatch, "#include <stdio.h>\n");
     fprintf(f_dispatch, "#include <stdlib.h>\n\n");
+    if (s_module_symbol) {
+        fprintf(f_dispatch, "uint32_t %s_base;\n", s_module_symbol);
+        for (int i = 0; i < all_funcs.count; i++) {
+            if (entry_owners[i] != all_funcs.addrs[i]) continue;
+            fprintf(f_dispatch, "void %s_resume_%06X(uint32_t);\n",
+                    s_module_symbol, all_funcs.addrs[i]);
+        }
+        fprintf(f_dispatch, "typedef void (*ModuleResume)(uint32_t);\n"
+                            "typedef struct { uint32_t offset; ModuleResume fn; } ModuleEntry;\n"
+                            "static const ModuleEntry entries[] = {\n");
+        for (int i = 0; i < resume_map.count; i++)
+            fprintf(f_dispatch, "  {0x%06Xu, %s_resume_%06X},\n",
+                    resume_map.items[i].addr, s_module_symbol, resume_map.items[i].owner);
+        fprintf(f_dispatch, "  {0, NULL}\n};\n"
+                            "static ModuleResume find(uint32_t offset) {\n"
+                            "  unsigned lo = 0, hi = %du;\n"
+                            "  while (lo < hi) { unsigned mid = lo + (hi-lo)/2;\n"
+                            "    if (entries[mid].offset < offset) lo = mid+1; else hi = mid; }\n"
+                            "  return lo < %du && entries[lo].offset == offset ? entries[lo].fn : NULL;\n"
+                            "}\n"
+                            "int %s_has_offset(uint32_t offset) { return find(offset) != NULL; }\n"
+                            "int %s_dispatch(uint32_t base, uint32_t offset) {\n"
+                            "  ModuleResume fn = find(offset); if (!fn) return 0;\n"
+                            "  uint32_t saved = %s_base; %s_base = base;\n"
+                            "  fn(offset); %s_base = saved; g_call_was_hybrid = 0; return 1;\n"
+                            "}\n",
+                resume_map.count, resume_map.count, s_module_symbol, s_module_symbol,
+                s_module_symbol, s_module_symbol, s_module_symbol);
+        goto dispatch_emitted;
+    }
     fprintf(f_dispatch,
         "typedef void (*FuncPtr)(void);\n"
         "typedef void (*ResumeFunc)(uint32_t);\n\n");
@@ -5166,6 +5235,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         "    recomp_call_addr(addr);\n"
         "}\n");
 
+dispatch_emitted:
     /* JMP-table dispatch audit. Derive the audit path from the dispatch
      * path by swapping `_dispatch.c` -> `_dispatch_audit.log`. Skip the
      * write silently if the path doesn't follow that convention; the audit
@@ -5361,5 +5431,26 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     addrset_free(&all_funcs);
     fclose(f_full);
     fclose(f_dispatch);
-    return true;
+    return !s_module_symbol || !s_falloff_count;
+}
+
+bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
+                  const char *out_full_path, const char *out_dispatch_path,
+                  const AnnotationTable *at, const GameConfig *cfg,
+                  bool reverse_debug) {
+    return codegen_emit_impl(rom, funcs, out_full_path, out_dispatch_path,
+                              at, cfg, reverse_debug, NULL);
+}
+
+bool codegen_emit_module(const GenesisRom *rom, const FunctionList *funcs,
+                         const char *out_full_path, const char *out_dispatch_path,
+                         const AnnotationTable *at, const GameConfig *cfg,
+                         const char *symbol) {
+    if (!symbol || !*symbol || !cfg || !cfg->async_resume_entries) return false;
+    for (const char *p = symbol; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              *p == '_' || (p != symbol && *p >= '0' && *p <= '9')))
+            return false;
+    return codegen_emit_impl(rom, funcs, out_full_path, out_dispatch_path,
+                              at, cfg, false, symbol);
 }
