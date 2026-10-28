@@ -72,6 +72,11 @@ void m68k_step_init(M68kStepContext *c,const M68kStepBus *bus,void *user)
     if(bus)c->bus=*bus;
     c->user=user;
 }
+int m68k_step_code_span(M68kStepContext *c,M68kStepCodeSpan span)
+{
+    if(!c||c->fault_escape)return 0;
+    c->code_span=span;return 1;
+}
 void m68k_step_set_sr(M68kStepContext *c,uint16_t value)
 {
     uint16_t old=c->state.regs.SR;
@@ -172,8 +177,12 @@ static M68kStepResult execute_operation(M68kStepContext *c,const M68kStepEntry *
     }
     uint32_t pc=c->state.regs.PC;
     if(entry) {
+        size_t bytes=(size_t)entry->word_count*2u;
+        const uint8_t *span=c->code_span && !(pc&1u) && pc<=0xffffffu && bytes<=0x1000000u-pc?
+            c->code_span(c->user,pc,bytes):NULL;
         for(unsigned n=0;n<entry->word_count;++n) {
-            uint16_t word=m68k_step_fetch16(c,pc+n*2u);
+            uint16_t word=span?(uint16_t)(((uint32_t)span[n*2u]<<8)|span[n*2u+1u]):
+                               m68k_step_fetch16(c,pc+n*2u);
             if(word!=entry->words[n]){c->fault_escape=NULL;return M68K_STEP_MISS;}
         }
     }

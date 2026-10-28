@@ -57,7 +57,15 @@ typedef struct M68kStepContext {
      * (fault_escape == NULL); these fields are not serialized. */
     void *fault_escape;
     unsigned charge;
+    /* Optional host-owned current program view. The callback returns a stable
+     * byte range only when every ordinary fetch would succeed without WAIT or
+     * side effects; NULL retains fetch16, including its faults/wait handling.
+     * The view is consumed immediately, never cached across instructions.
+     * Appended so existing generated operation prefix offsets stay unchanged. */
+    const uint8_t *(*code_span)(void *,uint32_t,size_t);
 } M68kStepContext;
+#define M68K_STEP_HAS_CODE_SPANS 1
+typedef const uint8_t *(*M68kStepCodeSpan)(void *,uint32_t,size_t);
 
 typedef void (*M68kStepOperation)(M68kStepContext *);
 typedef struct {
@@ -78,6 +86,9 @@ typedef struct {
 } M68kStepModule;
 
 void m68k_step_init(M68kStepContext *,const M68kStepBus *,void *user);
+/* Configure between completed operations. The ordinary fetch16 is still
+ * required; unsupported ranges always retain the original portable path. */
+int m68k_step_code_span(M68kStepContext *,M68kStepCodeSpan);
 M68kStepResult m68k_step_reset(M68kStepContext *);
 M68kStepResult m68k_step_execute(M68kStepContext *,const M68kStepEntry *);
 /* Runtime correctness floors use the same exception/WAIT/trace boundary.
