@@ -8,6 +8,7 @@
  * for call_by_address().
  */
 #include "code_generator.h"
+#include "m68k_timing.h"
 #include "codegen_diag.h"
 #include "m68k_decoder.h"
 #include "m68k_validator.h"
@@ -403,7 +404,7 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
     int reg  = ea & 7;
     const char *ct = size_ctype(sz);
     const char *rf = size_read_fn(sz);
-    int sb = size_bytes(sz);
+    int sb = reg==7 && sz==M68K_SIZE_B ? 2 : size_bytes(sz);
 
     switch (mode) {
     case 0: /* Dn */
@@ -634,7 +635,7 @@ static void emit_ea_store_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize s
     const char *ct  = size_ctype(sz);
     const char *wf  = size_write_fn(sz);
     uint32_t    msk = size_mask(sz);
-    int         sb  = size_bytes(sz);
+    int         sb  = reg==7 && sz==M68K_SIZE_B ? 2 : size_bytes(sz);
     (void)instr;
 
     switch (mode) {
@@ -1745,394 +1746,9 @@ static uint32_t *build_entry_owners(const GenesisRom *rom,
  * ========================================================================= */
 
 
-/* popcount of a 16-bit mask — used for MOVEM register count. */
-static int popcount16(uint16_t v) {
-    int c = 0;
-    while (v) { c += v & 1; v >>= 1; }
-    return c;
-}
-
-/* ===========================================================================
- * MC68000 instruction timing model (Programmer's Reference Manual, Appendix
- * B / "Instruction Execution Times").
- *
- * DECODER CONTRACT — the thing that made the old table wrong. `dst_ea` is
- * populated by exactly ONE decoder path: the MOVE/MOVEA family
- * (m68k_decoder.c:239). Every other instruction leaves `dst_ea` at its
- * memset-0 value, which reads back as "Dn". Any cost rule that keyed off
- * `dst_ea` therefore silently skipped the operand EA cost for CLR, TST, NEG,
- * NOT, ADDQ/SUBQ, the immediate-arith family, the bit instructions, Scc and
- * the memory shifts — a systematic undercount on ~27% of all instructions.
- * The operand EA for every non-MOVE instruction lives in `src_ea`.
- *
- * STATIC-STAMP POLICY. These costs are stamped once per address at codegen
- * time and summed into g_audio_cycle_counter at runtime, so instructions
- * whose real cost depends on runtime state must be pinned to one documented
- * value:
- *   - Bcc / DBcc / BRA / BSR      -> the TAKEN cost. Branch-dominated loops
- *                                    are the common case, and taken is a real
- *                                    hardware value rather than an average.
- *   - Scc                         -> the TRUE cost (Dn form; 6 not 4).
- *   - Register-count shifts       -> average count of 4.
- *   - MULU / MULS                 -> 38 + 2*8, the average-operand form.
- *   - DIVU / DIVS                 -> PRM worst case (the spread is narrow).
- * ======================================================================== */
-
-/* PRM Table 8-1 "Effective Address Calculation Times" — cycles to compute
- * and FETCH an operand through this EA, on top of the instruction base.
- * Size-dependent: a longword costs one extra memory round-trip. */
-static int ea_calc_cost(int ea, M68KSize sz)
-{
-    int is_long = (sz == M68K_SIZE_L);
-    int mode    = (ea >> 3) & 7;
-    int reg     =  ea       & 7;
-    if (ea < 0) return 0;                      /* -1 = immediate pseudo-operand */
-    switch (mode) {
-    case 0: /* Dn */           return 0;
-    case 1: /* An */           return 0;
-    case 2: /* (An)        */  return is_long ? 8  : 4;
-    case 3: /* (An)+       */  return is_long ? 8  : 4;
-    case 4: /* -(An)       */  return is_long ? 10 : 6;
-    case 5: /* d16(An)     */  return is_long ? 12 : 8;
-    case 6: /* d8(An,Xn)   */  return is_long ? 14 : 10;
-    case 7:
-        switch (reg) {
-        case 0: /* (xxx).W  */ return is_long ? 12 : 8;
-        case 1: /* (xxx).L  */ return is_long ? 16 : 12;
-        case 2: /* d16(PC)  */ return is_long ? 12 : 8;
-        case 3: /* d8(PC,Xn)*/ return is_long ? 14 : 10;
-        case 4: /* #imm     */ return is_long ? 8  : 4;
-        }
-    }
-    return 0;
-}
-
-/* MOVE DESTINATION cost. Distinct from ea_calc_cost: on a MOVE destination
- * the predecrement is overlapped with the write, so -(An) costs the same as
- * (An) (4/8) rather than the 6/10 an operand FETCH through -(An) costs.
- * PC-relative and immediate are not legal destinations. */
-static int ea_move_dst_cost(int ea, M68KSize sz)
-{
-    int is_long = (sz == M68K_SIZE_L);
-    int mode    = (ea >> 3) & 7;
-    int reg     =  ea       & 7;
-    if (ea < 0) return 0;
-    switch (mode) {
-    case 0: /* Dn */           return 0;
-    case 1: /* An */           return 0;
-    case 2: /* (An)        */  return is_long ? 8  : 4;
-    case 3: /* (An)+       */  return is_long ? 8  : 4;
-    case 4: /* -(An)       */  return is_long ? 8  : 4;   /* NOT 10/6 */
-    case 5: /* d16(An)     */  return is_long ? 12 : 8;
-    case 6: /* d8(An,Xn)   */  return is_long ? 14 : 10;
-    case 7:
-        switch (reg) {
-        case 0: /* (xxx).W  */ return is_long ? 12 : 8;
-        case 1: /* (xxx).L  */ return is_long ? 16 : 12;
-        }
-    }
-    return 0;
-}
-
-static int ea_is_reg(int ea)      /* Dn or An */
-{
-    if (ea < 0) return 0;
-    return ((ea >> 3) & 7) <= 1;
-}
-
-/* Dn / An / #imm — the source forms that add 2 cycles to the LONG
- * "<ea>,Dn" arithmetic forms (PRM's "+2 if source is register or
- * immediate" footnote on ADD/SUB/AND/OR/CMP and ADDA/SUBA). */
-static int ea_is_reg_or_imm(int ea)
-{
-    if (ea < 0) return 1;
-    int mode = (ea >> 3) & 7;
-    return mode <= 1 || (mode == 7 && (ea & 7) == 4);
-}
-
-/* JMP / JSR / LEA / PEA carry their own complete per-mode timings rather
- * than base+EA. Column order: JMP, JSR, LEA, PEA. */
-static int ea_control_cost(int ea, int col)
-{
-    static const int T[8][4] = {
-        /*                JMP  JSR  LEA  PEA */
-        /* 0 (An)     */ {  8,  16,   4,  12 },
-        /* 1 (d16,An) */ { 10,  18,   8,  16 },
-        /* 2 (d8,An,X)*/ { 14,  22,  12,  20 },
-        /* 3 (xxx).W  */ { 10,  18,   8,  16 },
-        /* 4 (xxx).L  */ { 12,  20,  12,  20 },
-        /* 5 (d16,PC) */ { 10,  18,   8,  16 },
-        /* 6 (d8,PC,X)*/ { 14,  22,  12,  20 },
-        /* 7 other    */ {  8,  16,   4,  12 },
-    };
-    int mode = (ea >> 3) & 7;
-    int reg  =  ea       & 7;
-    int row;
-    switch (mode) {
-    case 2:  row = 0; break;
-    case 5:  row = 1; break;
-    case 6:  row = 2; break;
-    case 7:
-        switch (reg) {
-        case 0:  row = 3; break;
-        case 1:  row = 4; break;
-        case 2:  row = 5; break;
-        case 3:  row = 6; break;
-        default: row = 7; break;
-        }
-        break;
-    default: row = 7; break;
-    }
-    return T[row][col];
-}
-#define EACTL_JMP 0
-#define EACTL_JSR 1
-#define EACTL_LEA 2
-#define EACTL_PEA 3
-
-/* MOVEM addressing-mode surcharge, on top of the direction base and the
- * per-register term. PRM MOVEM table decomposed as base + this + n-term. */
-static int ea_movem_extra(int ea)
-{
-    int mode = (ea >> 3) & 7;
-    int reg  =  ea       & 7;
-    switch (mode) {
-    case 2: case 3: case 4:  return 0;   /* (An), (An)+, -(An) */
-    case 5:                  return 4;   /* (d16,An)  */
-    case 6:                  return 6;   /* (d8,An,Xn)*/
-    case 7:
-        switch (reg) {
-        case 0: return 4;                /* (xxx).W   */
-        case 1: return 8;                /* (xxx).L   */
-        case 2: return 4;                /* (d16,PC)  */
-        case 3: return 6;                /* (d8,PC,Xn)*/
-        }
-    }
-    return 0;
-}
-
+/* One nominal timing policy is shared by generated code and the live floor. */
 static int estimate_cycles_prm(const M68KInstr *instr)
-{
-    M68KSize sz      = instr->size;
-    int      is_long = (sz == M68K_SIZE_L);
-    /* THE operand EA for every non-MOVE instruction (see decoder contract
-     * above). `ea` is its fetch cost; `op_is_reg` says the operand is a
-     * register rather than memory. */
-    int      ea        = ea_calc_cost(instr->src_ea, sz);
-    int      op_is_reg = ea_is_reg(instr->src_ea);
-    uint16_t w0        = instr->words[0];
-
-    switch (instr->mnemonic) {
-    /* ---- Control flow ------------------------------------------------ */
-    case MN_NOP:   return 4;
-    case MN_RTS:   return 16;
-    case MN_RTE:   return 20;
-    case MN_RTR:   return 20;
-    case MN_STOP:  return 4;
-    case MN_JSR:   return ea_control_cost(instr->src_ea, EACTL_JSR);
-    case MN_JMP:   return ea_control_cost(instr->src_ea, EACTL_JMP);
-    case MN_BSR:   return 18;                 /* .S and .W alike */
-    case MN_BRA:   return 10;
-    case MN_Bcc:   return 10;                 /* TAKEN (policy) — untaken is 8 .S / 12 .W */
-    case MN_DBcc:  return 10;                 /* TAKEN (policy) — cc true 12, expired 14 */
-
-    /* ---- Moves -------------------------------------------------------- */
-    case MN_MOVE:
-        /* Only MOVE/MOVEA populate dst_ea, and the destination uses the
-         * MOVE-specific write table. */
-        return 4 + ea + ea_move_dst_cost(instr->dst_ea, sz);
-    case MN_MOVEA: return 4 + ea;
-    case MN_MOVEQ: return 4;
-    case MN_LEA:   return ea_control_cost(instr->src_ea, EACTL_LEA);
-    case MN_PEA:   return ea_control_cost(instr->src_ea, EACTL_PEA);
-
-    /* ---- MOVEM: direction base + mode surcharge + per-register term ---- */
-    case MN_MOVEM: {
-        int nregs   = (instr->word_count >= 2) ? popcount16(instr->words[1]) : 4;
-        int mem2reg = (w0 >> 10) & 1;         /* dr bit: 1 = <ea> -> registers */
-        int base    = mem2reg ? 12 : 8;
-        return base + ea_movem_extra(instr->src_ea)
-                    + (is_long ? 8 : 4) * nregs;
-    }
-
-    /* ---- Binary arithmetic / logic ------------------------------------ */
-    case MN_ADD: case MN_SUB: case MN_AND: case MN_OR: {
-        /* Direction bit 8: 0 = <ea>,Dn ; 1 = Dn,<ea>. */
-        int to_mem = (w0 >> 8) & 1;
-        if (to_mem)
-            return (is_long ? 12 : 8) + ea;
-        /* <ea>,Dn — long form costs 2 more when the source is a register
-         * or an immediate (PRM footnote). */
-        if (is_long)
-            return (ea_is_reg_or_imm(instr->src_ea) ? 8 : 6) + ea;
-        return 4 + ea;
-    }
-
-    case MN_CMP:
-        /* CMP is <ea>,Dn only. */
-        if (is_long)
-            return 6 + ea;
-        return 4 + ea;
-
-    case MN_EOR:
-        /* EOR is Dn,<ea> only. */
-        if (op_is_reg) return is_long ? 8 : 4;
-        return (is_long ? 12 : 8) + ea;
-
-    case MN_ADDA: case MN_SUBA:
-        if (is_long)
-            return (ea_is_reg_or_imm(instr->src_ea) ? 8 : 6) + ea;
-        return 8 + ea;
-
-    case MN_CMPA:
-        return 6 + ea;
-
-    case MN_ADDQ: case MN_SUBQ:
-        if (op_is_reg) {
-            /* An destination is 8 for both word and long (PRM Table 8-8).
-             * DELIBERATE DEVIATION FROM clown68000, which reports 10 here:
-             * Action_ADDQ runs Action_ADD's standard register timing and
-             * then StandardInstructionExecutionTimeQuick adds another 2 for
-             * the An mode (clown68000.c:739), double-charging the surcharge.
-             * The PRM value is 8. */
-            if (((instr->src_ea >> 3) & 7) == 1) return 8;
-            return is_long ? 8 : 4;
-        }
-        return (is_long ? 12 : 8) + ea;
-
-    case MN_ADDX: case MN_SUBX:
-        if (instr->predec_mem_form) return is_long ? 30 : 18;
-        return is_long ? 8 : 4;
-
-    case MN_CMPM:
-        return is_long ? 20 : 12;
-
-    /* ---- Immediate arithmetic ----------------------------------------- */
-    case MN_ADDI: case MN_SUBI: case MN_ANDI: case MN_ORI: case MN_EORI:
-        if (op_is_reg) return is_long ? 16 : 8;
-        return (is_long ? 20 : 12) + ea;
-
-    case MN_CMPI:
-        if (op_is_reg) return is_long ? 14 : 8;
-        return (is_long ? 12 : 8) + ea;
-
-    case MN_ORI_TO_CCR:  case MN_ANDI_TO_CCR: case MN_EORI_TO_CCR:
-    case MN_ORI_TO_SR:   case MN_ANDI_TO_SR:  case MN_EORI_TO_SR:
-        return 20;
-
-    /* ---- Shifts and rotates ------------------------------------------- */
-    case MN_LSL: case MN_LSR:
-    case MN_ASL: case MN_ASR:
-    case MN_ROL: case MN_ROR:
-    case MN_ROXL: case MN_ROXR: {
-        /* Memory form: always one bit, always a word operand. */
-        if (instr->mem_shift) return 8 + ea;
-        /* Register form: base + 2 per bit shifted. Bit 5 selects a
-         * register count, which is not statically knowable — policy is an
-         * average of 4 (see the header comment). */
-        int reg_count_mode = (w0 >> 5) & 1;
-        int n;
-        if (reg_count_mode) {
-            n = 4;
-        } else {
-            n = (w0 >> 9) & 7;
-            if (n == 0) n = 8;
-        }
-        return (is_long ? 8 : 6) + 2 * n;
-    }
-
-    /* ---- Multiply / divide (data-dependent; documented policy) --------- */
-    case MN_MULU: case MN_MULS: return 38 + 2 * 8 + ea;   /* average operand */
-    case MN_DIVU:               return 140 + ea;
-    case MN_DIVS:               return 158 + ea;
-
-    /* ---- Unary --------------------------------------------------------- */
-    case MN_TST:
-        /* TST does not write back: 4 + EA, no RMW surcharge. */
-        if (op_is_reg) return 4;
-        return 4 + ea;
-
-    case MN_CLR:
-    case MN_NEG: case MN_NEGX: case MN_NOT:
-        if (op_is_reg) return is_long ? 6 : 4;
-        return (is_long ? 12 : 8) + ea;
-
-    case MN_NBCD: return op_is_reg ? 6  : 8  + ea;
-    case MN_TAS:  return op_is_reg ? 4  : 14 + ea;
-
-    /* ---- Sign extension ------------------------------------------------ */
-    case MN_EXT:  return 4;
-    case MN_SWAP: return 4;
-
-    /* ---- Bit instructions ----------------------------------------------
-     * Static (#imm) forms cost more on a register than the dynamic (Dn)
-     * forms. Bit 8 of the opcode distinguishes them: set = dynamic. */
-    case MN_BTST: {
-        int dynamic = (w0 >> 8) & 1;
-        if (op_is_reg) return dynamic ? 6 : 10;
-        return (dynamic ? 4 : 8) + ea;
-    }
-    case MN_BCHG: case MN_BSET: case MN_BCLR: {
-        int dynamic = (w0 >> 8) & 1;
-        int is_bclr = (instr->mnemonic == MN_BCLR);
-        if (op_is_reg) {
-            /* Dn destination = a 32-bit operand. The 68000's 16-bit ALU only
-             * has to touch the low word when the bit number is < 16, which
-             * costs 2 cycles less. For the STATIC form the bit number is an
-             * immediate in the extension word, so this is exactly knowable
-             * at codegen time; for the DYNAMIC form it is a runtime register
-             * and we hold the PRM high-word value. */
-            if (dynamic) return is_bclr ? 10 : 8;
-            int low_bit = (instr->imm32 & 31u) < 16u;
-            if (is_bclr) return low_bit ? 12 : 14;
-            return low_bit ? 10 : 12;
-        }
-        /* Memory destination is a BYTE operand — no high/low-word split.
-         * Static (#imm) forms cost 12+EA, not 8+EA: the extension word
-         * carrying the bit number is an extra prefetch. */
-        return (dynamic ? 8 : 12) + ea;
-    }
-
-    /* ---- Link / Unlink -------------------------------------------------- */
-    case MN_LINK: return 16;
-    case MN_UNLK: return 12;
-
-    /* ---- Conditional set ------------------------------------------------ */
-    case MN_Scc:
-        if (op_is_reg) return 6;              /* TRUE (policy); false is 4 */
-        return 8 + ea;
-
-    /* ---- Traps / privileged --------------------------------------------- */
-    case MN_TRAP:    return 34;
-    case MN_TRAPV:   return 4;                /* untaken */
-    case MN_CHK:     return 10 + ea;          /* no-trap path */
-    case MN_RESET:   return 132;
-    case MN_ILLEGAL: return 34;
-
-    /* ---- BCD ------------------------------------------------------------ */
-    case MN_ABCD: case MN_SBCD:
-        return instr->predec_mem_form ? 18 : 6;
-
-    /* ---- Misc ------------------------------------------------------------ */
-    case MN_EXG:       return 6;
-    case MN_MOVE_USP:  return 4;
-    case MN_MOVEC:     return 12;             /* 68010+; not reachable on 68000 */
-    case MN_MOVE_SR:
-        /* MOVE SR,<ea> writes; MOVE <ea>,SR reads. */
-        if (instr->dst_is_ea)
-            return op_is_reg ? 6 : (8 + ea);
-        return 12 + ea;
-    case MN_MOVE_CCR:
-        return 12 + ea;                       /* MOVE <ea>,CCR (68000 has no MOVE CCR,<ea>) */
-    case MN_MOVEP:     return is_long ? 24 : 16;
-
-    case MN_OTHER:
-    default:
-        /* Unmodelled opcode: base 4 plus whatever operand fetch the
-         * decoder did identify. */
-        return 4 + ea;
-    }
-}
+{return (int)m68k_68000_nominal_cycles(instr);}
 
 /* Per-address record of the EXACT cost the generated code was stamped with.
  * Emitted as <prefix>_cycles.c so the Tier-3 interpreter floor charges the
@@ -2291,13 +1907,15 @@ static void emit_mem_shift(FILE *f, const M68KInstr *instr,
     fprintf(f, "  }\n");
 }
 
+static unsigned step_operand_cost(unsigned ea,bool is_long);
+
 static void emit_instr(FILE *f, const GenesisRom *rom,
                         const M68KInstr *instr,
                         const AddrSet *instrs,
                         bool *skip_until_label,
                         int *has_sp_adjust,
                         const char *func_name,
-                        uint32_t func_addr) {
+                        uint32_t func_addr, bool step_runtime) {
     uint32_t addr = instr->addr;
     M68KSize sz   = instr->size;
     s_diag_func_name = func_name;
@@ -3228,9 +2846,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
 
     /* ------------------------------------------------------------------ */
     case MN_CMPM: {
-        /* CMPM (Ay)+,(Ax)+ — read both via post-increment, compute
-         * Ax-source - Ay-source as a CMP, set flags, then advance both
-         * address registers. X is unchanged (same as CMP).
+        /* CMPM (Ay)+,(Ax)+ — read/increment source, then read/increment
+         * destination. This order matters when Ax and Ay are the same.
+         * Compute destination - source as CMP; X is unchanged.
          *
          * 68K quirk: byte-size post-increment on A7 increments by 2
          * to keep the supervisor stack aligned. CMPM (A7)+,(A7)+ is
@@ -3246,20 +2864,20 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         snprintf(res, sizeof(res), "_%06Xr", addr);
         fprintf(f,
             "  { %s _cmpm_s = (%s)%s(g_cpu.A[%d]);\n"
+            "    g_cpu.A[%d] += %d;\n"
             "    %s _cmpm_d = (%s)%s(g_cpu.A[%d]);\n"
+            "    g_cpu.A[%d] += %d;\n"
             "    %s %s = (%s)(_cmpm_d - _cmpm_s);\n",
             ct, ct, rf, ay,
+            ay, ay_inc,
             ct, ct, rf, ax,
+            ax, ax_inc,
             ct, res, ct);
         char da[64], db[64];
         snprintf(da, sizeof(da), "_cmpm_d");
         snprintf(db, sizeof(db), "_cmpm_s");
         emit_flags_cmp(f, da, db, res, sz);
-        fprintf(f,
-            "    g_cpu.A[%d] += %d;\n"
-            "    g_cpu.A[%d] += %d;\n"
-            "  }\n",
-            ay, ay_inc, ax, ax_inc);
+        fprintf(f,"  }\n");
         break;
     }
 
@@ -3289,8 +2907,14 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * silently zeroing the X flag set by the earlier subi.b in
          * PSGSetFreq — corrupting downstream Bcc paths that read X
          * (squelched notes, drift). */
-        ExtReader er2; er_init(&er2, instr);
-        emit_ea_store_ex(f, instr, instr->src_ea, sz, &er2, "0", 1);
+        /* The original 68000 reads memory CLR operands before clearing them.
+         * Emit both phases as one RMW so (An)+ / -(An) update once, and use
+         * matching extension readers so each phase resolves the same EA. */
+        ExtReader read_er; er_init(&read_er, instr);
+        char discarded[256];
+        emit_ea_load_ex(f, instr, instr->src_ea, sz, &read_er, tmp, discarded, 1);
+        ExtReader write_er; er_init(&write_er, instr);
+        emit_ea_store_ex(f, instr, instr->src_ea, sz, &write_er, "0", 1);
         fprintf(f, "  g_cpu.SR = (g_cpu.SR & ~0x0Fu) | (1u<<2);\n");
         break;
     }
@@ -3627,6 +3251,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ROXR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
         int dreg  = instr->reg;
+        bool reg_count = (instr->words[0] & 32u) != 0;
         int count = (int)(instr->imm32 & 63);
         bool left = (instr->mnemonic == MN_ROXL);
         const char *ct = size_ctype(sz);
@@ -3644,7 +3269,16 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "  { %s _sv = (%s)g_cpu.D[%d];\n", ct, ct, dreg);
         fprintf(f, "    uint64_t _x = (g_cpu.SR >> 4) & 1u;\n");
         fprintf(f, "    uint64_t _wide = ((uint64_t)_sv) | (_x << %d);\n", bits);
-        if (c == 0) {
+        if (reg_count) {
+            fprintf(f, "    unsigned _cc = (g_cpu.D[%u] & 63u) %% %uu;\n",
+                    (unsigned)instr->src_ea, (unsigned)(bits + 1));
+            if (left)
+                fprintf(f, "    uint64_t _rot = ((_wide << _cc) | (_wide >> (%u - _cc))) & 0x%llXull;\n",
+                        (unsigned)(bits + 1), widemask);
+            else
+                fprintf(f, "    uint64_t _rot = ((_wide >> _cc) | (_wide << (%u - _cc))) & 0x%llXull;\n",
+                        (unsigned)(bits + 1), widemask);
+        } else if (c == 0) {
             fprintf(f, "    uint64_t _rot = _wide & 0x%llXull;\n", widemask);
         } else if (left) {
             fprintf(f, "    uint64_t _rot = ((_wide << %d) | (_wide >> %d)) & 0x%llXull;\n",
@@ -3693,7 +3327,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     /* ------------------------------------------------------------------ */
     case MN_DIVU: {
         int dreg = instr->reg;
-        char tmp2[32];
+        char tmp2[32], zero[192];
+        if(step_runtime)snprintf(zero,sizeof zero,"m68k_step_exception(ctx,5,g_cpu.PC,%u); return;",38u+step_operand_cost((unsigned)instr->src_ea,false));
+        else snprintf(zero,sizeof zero,"g_cpu.PC=0x%06Xu; m68k_trap_vector(5u); return;",addr);
         snprintf(tmp2, sizeof(tmp2), "_tv%06X", addr);
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp2, src_expr);
         /* HW-accurate (matches clown68000 / the Tier-3 floor): on quotient
@@ -3702,8 +3338,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f,
             "  { uint16_t _dv = (uint16_t)(%s); uint32_t _dest = g_cpu.D[%d];\n"
             "    g_cpu.SR &= ~(1u<<0);\n"
-            "    if (_dv == 0u) { g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1)); }\n"
-            "    else if ((uint32_t)_dv >= (_dest >> 16)) {\n"
+            "    if (_dv == 0u) { %s }\n"
+            "    else if ((uint32_t)_dv > (_dest >> 16)) {\n"
             "      uint32_t _quo = _dest / _dv, _rem = _dest %% _dv;\n"
             "      g_cpu.D[%d] = (_quo & 0xFFFFu) | ((_rem & 0xFFFFu) << 16);\n"
             "      g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1));\n"
@@ -3711,14 +3347,16 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             "      if (_quo == 0u)     g_cpu.SR |= (1u<<2);\n"
             "    } else { g_cpu.SR |= (1u<<1); g_cpu.SR |= (1u<<3); g_cpu.SR &= ~(1u<<2); }\n"
             "  }\n",
-            src_expr, dreg, dreg);
+            src_expr, dreg, zero, dreg);
         break;
     }
 
     /* ------------------------------------------------------------------ */
     case MN_DIVS: {
         int dreg = instr->reg;
-        char tmp2[32];
+        char tmp2[32], zero[192];
+        if(step_runtime)snprintf(zero,sizeof zero,"m68k_step_exception(ctx,5,g_cpu.PC,%u); return;",38u+step_operand_cost((unsigned)instr->src_ea,false));
+        else snprintf(zero,sizeof zero,"g_cpu.PC=0x%06Xu; m68k_trap_vector(5u); return;",addr);
         snprintf(tmp2, sizeof(tmp2), "_tv%06X", addr);
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp2, src_expr);
         /* HW-accurate signed divide (matches clown68000 / the Tier-3 floor):
@@ -3727,7 +3365,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f,
             "  { int16_t _dv = (int16_t)(%s); uint32_t _dest = g_cpu.D[%d];\n"
             "    g_cpu.SR &= ~(1u<<0);\n"
-            "    if (_dv == 0) { g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1)); }\n"
+            "    if (_dv == 0) { %s }\n"
             "    else {\n"
             "      int _sn = (_dv < 0), _dn = ((int32_t)_dest < 0); int _rn = (_sn != _dn);\n"
             "      uint32_t _asrc = _sn ? (uint32_t)(0 - (int32_t)_dv) : (uint32_t)_dv;\n"
@@ -3746,7 +3384,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             "      } else { g_cpu.SR |= (1u<<1); g_cpu.SR |= (1u<<3); g_cpu.SR &= ~(1u<<2); }\n"
             "    }\n"
             "  }\n",
-            src_expr, dreg, dreg);
+            src_expr, dreg, zero, dreg);
         break;
     }
 
@@ -4482,6 +4120,194 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
  * Main codegen entry point
  * ========================================================================= */
 
+bool codegen_emit_step_semantics(FILE *f, const GenesisRom *rom,
+                                 const M68KInstr *ins)
+{
+    if (!f || !rom || !ins) return false;
+    /* Deliberately explicit: adding a mnemonic to the legacy emitter does not
+     * silently enroll a control/privilege/exception instruction in this ABI.
+     * The step frontend owns PC, hardware exceptions and supervisor stacks. */
+    switch (ins->mnemonic) {
+    case MN_NOP: case MN_MOVE: case MN_MOVEA: case MN_MOVEQ:
+    case MN_LEA: case MN_PEA: case MN_LINK: case MN_UNLK: case MN_MOVEM:
+    case MN_ADD: case MN_ADDA: case MN_ADDQ: case MN_ADDI:
+    case MN_SUB: case MN_SUBA: case MN_SUBQ: case MN_SUBI:
+    case MN_AND: case MN_ANDI: case MN_OR: case MN_ORI: case MN_EOR: case MN_EORI:
+    case MN_CMP: case MN_CMPA: case MN_CMPI: case MN_CMPM:
+    case MN_TST: case MN_CLR: case MN_NEG: case MN_NEGX: case MN_NOT:
+    case MN_SWAP: case MN_EXT:
+    case MN_LSL: case MN_LSR: case MN_ASL: case MN_ASR:
+    case MN_ROL: case MN_ROR: case MN_ROXL: case MN_ROXR:
+    case MN_MULS: case MN_MULU: case MN_ABCD: case MN_SBCD: case MN_NBCD:
+    case MN_BTST: case MN_BCHG: case MN_BCLR: case MN_BSET:
+    case MN_MOVEP: case MN_TAS: case MN_EXG: case MN_ADDX: case MN_SUBX:
+    case MN_Scc: case MN_MOVE_CCR:
+    case MN_ORI_TO_CCR: case MN_ANDI_TO_CCR: case MN_EORI_TO_CCR:
+        break;
+    default:
+        return false;
+    }
+    const WsSite *saved_sites = s_ws_sites;
+    int saved_count = s_ws_site_count;
+    bool saved_reverse = s_reverse_debug;
+    const char *saved_name = s_diag_func_name;
+    uint32_t saved_addr = s_diag_func_addr;
+    const M68KInstr *saved_ins = s_diag_instr;
+    s_ws_sites = NULL; s_ws_site_count = 0; s_reverse_debug = false;
+    AddrSet instructions = {0};
+    bool skip = false;
+    int stack_accounting = 0;
+    emit_instr(f, rom, ins, &instructions, &skip, &stack_accounting, "<step>", ins->addr, false);
+    s_ws_sites = saved_sites; s_ws_site_count = saved_count;
+    s_reverse_debug = saved_reverse;
+    s_diag_func_name = saved_name; s_diag_func_addr = saved_addr; s_diag_instr = saved_ins;
+    addrset_free(&instructions);
+    return !skip && !ferror(f);
+}
+
+static unsigned step_operand_cost(unsigned ea, bool is_long)
+{return m68k_68000_operand_cycles(ea,is_long);}
+
+static unsigned step_jump_cost(unsigned ea, bool call)
+{return m68k_68000_jump_cycles(ea,call);}
+
+static bool emit_step_control(FILE *f,const GenesisRom *rom,const M68KInstr *ins)
+{
+    ExtReader er;er_init(&er,ins);
+    char expr[256], tmp[32];snprintf(tmp,sizeof tmp,"_step%06X",ins->addr);
+    uint32_t next=(ins->addr+2u*ins->word_count)&0xFFFFFFu;
+    switch(ins->mnemonic) {
+    case MN_RTS:
+        fprintf(f,"  ctx->charge=16; g_cpu.PC=m68k_read32(g_cpu.A[7])&0xFFFFFFu; g_cpu.A[7]+=4;\n");return true;
+    case MN_RTE:
+        fprintf(f,"  ctx->charge=20; m68k_step_rte(ctx);\n");return true;
+    case MN_RTR:
+        fprintf(f,"  ctx->charge=20; { uint32_t sp=g_cpu.A[7]; uint16_t ccr=m68k_read16(sp);\n"
+                  "    uint32_t pc=m68k_read32(sp+2); g_cpu.A[7]=sp+6;\n"
+                  "    g_cpu.SR=(uint16_t)((g_cpu.SR&0xFF00u)|(ccr&31u)); g_cpu.PC=pc&0xFFFFFFu; }\n");return true;
+    case MN_STOP:
+        fprintf(f,"  ctx->charge=4; m68k_step_stop(ctx,0x%04Xu);\n",(unsigned)(ins->imm32&65535));return true;
+    case MN_RESET:
+        fprintf(f,"  ctx->charge=132; m68k_step_reset_devices(ctx);\n");return true;
+    case MN_TRAP:
+        fprintf(f,"  m68k_step_exception(ctx,%uu,g_cpu.PC,34);\n",32u+(unsigned)(ins->imm32&15));return true;
+    case MN_TRAPV:
+        fprintf(f,"  ctx->charge=4; if(g_cpu.SR&2u)m68k_step_exception(ctx,7,g_cpu.PC,34);\n");return true;
+    case MN_ILLEGAL: case MN_MOVEC: {
+        unsigned top=ins->words[0]>>12, vector=top==10?10u:top==15?11u:4u;
+        fprintf(f,"  m68k_step_exception(ctx,%uu,0x%06Xu,34);\n",vector,ins->addr);return true;
+    }
+    case MN_BRA: case MN_BSR: case MN_Bcc: case MN_DBcc:
+        if(!ins->has_target)return false;
+        if(ins->mnemonic==MN_BRA) {
+            fprintf(f,"  ctx->charge=10; g_cpu.PC=0x%06Xu;\n",ins->target_addr&0xFFFFFFu);
+        } else if(ins->mnemonic==MN_BSR) {
+            fprintf(f,"  ctx->charge=18; g_cpu.A[7]-=4; m68k_write32(g_cpu.A[7],0x%06Xu); g_cpu.PC=0x%06Xu;\n",next,ins->target_addr&0xFFFFFFu);
+        } else if(ins->mnemonic==MN_Bcc) {
+            fprintf(f,"  if(%s){ctx->charge=10;g_cpu.PC=0x%06Xu;}else ctx->charge=%u;\n",
+                    bcc_cond_expr((ins->words[0]>>8)&15),ins->target_addr&0xFFFFFFu,ins->word_count==1?8u:12u);
+        } else {
+            fprintf(f,"  if(!(%s)){ uint16_t low=(uint16_t)(g_cpu.D[%u]-1u);\n"
+                      "    g_cpu.D[%u]=(g_cpu.D[%u]&0xFFFF0000u)|low;\n"
+                      "    if(low!=0xFFFFu){ctx->charge=10;g_cpu.PC=0x%06Xu;}else ctx->charge=14;\n"
+                      "  }else ctx->charge=12;\n",bcc_cond_expr((ins->words[0]>>8)&15),
+                      (unsigned)ins->reg,(unsigned)ins->reg,(unsigned)ins->reg,ins->target_addr&0xFFFFFFu);
+        }
+        return true;
+    case MN_JMP: case MN_JSR: {
+        bool call=ins->mnemonic==MN_JSR;
+        unsigned cost=step_jump_cost((unsigned)ins->src_ea,call);
+        if(!cost)return false;
+        emit_ea_addr_ex(f,ins,ins->src_ea,&er,expr,true);
+        fprintf(f,"  { uint32_t target=(%s)&0xFFFFFFu; ctx->charge=%u;\n",expr,cost);
+        if(call)fprintf(f,"    g_cpu.A[7]-=4; m68k_write32(g_cpu.A[7],0x%06Xu);\n",next);
+        fprintf(f,"    g_cpu.PC=target; }\n");return true;
+    }
+    case MN_MOVE_USP:
+        fprintf(f,"  if(!m68k_step_supervisor(ctx))return; ctx->charge=4;\n");
+        if(ins->words[0]&8)fprintf(f,"  g_cpu.A[%u]=g_cpu.USP;\n",(unsigned)ins->reg);
+        else fprintf(f,"  g_cpu.USP=g_cpu.A[%u];\n",(unsigned)ins->reg);
+        return true;
+    case MN_MOVE_SR:
+        if(!ins->dst_is_ea) {
+            fprintf(f,"  if(!m68k_step_supervisor(ctx))return;\n");
+            fprintf(f,"  ctx->charge=%u;\n",12u+step_operand_cost((unsigned)ins->src_ea,false));
+            emit_ea_load(f,ins,ins->src_ea,M68K_SIZE_W,&er,tmp,expr);
+            fprintf(f,"  m68k_step_set_sr(ctx,(uint16_t)(%s));\n",expr);
+        } else {
+            unsigned cost=(ins->src_ea>>3)==0?6u:8u+step_operand_cost((unsigned)ins->src_ea,false);
+            fprintf(f,"  ctx->charge=%u;\n",cost);
+            emit_ea_store(f,ins,ins->src_ea,M68K_SIZE_W,&er,"g_cpu.SR");
+        }
+        return true;
+    case MN_MOVE_CCR:
+        if(!ins->dst_is_ea)return false; /* MOVE to CCR is straight-line. */
+        /* MOVE from CCR is a 68010 instruction, illegal on the CD's 68000. */
+        fprintf(f,"  m68k_step_exception(ctx,4,0x%06Xu,34);\n",ins->addr);return true;
+    case MN_ORI_TO_SR: case MN_ANDI_TO_SR: case MN_EORI_TO_SR: {
+        const char *op=ins->mnemonic==MN_ORI_TO_SR?"|":ins->mnemonic==MN_ANDI_TO_SR?"&":"^";
+        fprintf(f,"  if(!m68k_step_supervisor(ctx))return;\n"
+                  "  ctx->charge=20;\n"
+                  "  m68k_step_set_sr(ctx,(uint16_t)(g_cpu.SR%s0x%04Xu));\n",op,(unsigned)(ins->imm32&65535));return true;
+    }
+    case MN_DIVU: case MN_DIVS: {
+        AddrSet instructions={0};bool skip=false;int stack_accounting=0;
+        /* Nominal nonzero costs; data-dependent divide timing still needs
+         * qualification. Zero division enters the real vector-five frame. */
+        fprintf(f,"  ctx->charge=%u;\n",(ins->mnemonic==MN_DIVU?140u:158u)+step_operand_cost((unsigned)ins->src_ea,false));
+        emit_instr(f,rom,ins,&instructions,&skip,&stack_accounting,"<step>",ins->addr,true);
+        addrset_free(&instructions);return !skip;
+    }
+    case MN_CHK: {
+        unsigned ea=step_operand_cost((unsigned)ins->src_ea,false);
+        emit_ea_load(f,ins,ins->src_ea,M68K_SIZE_W,&er,tmp,expr);
+        fprintf(f,"  ctx->charge=%u; { int16_t value=(int16_t)g_cpu.D[%u], bound=(int16_t)(%s);\n"
+                  "    if(value<0){g_cpu.SR|=8u;m68k_step_exception(ctx,6,g_cpu.PC,%u);}\n"
+                  "    else if(value>bound){g_cpu.SR&=(uint16_t)~8u;m68k_step_exception(ctx,6,g_cpu.PC,%u);} }\n",
+                  10u+ea,(unsigned)ins->reg,expr,40u+ea,40u+ea);return true;
+    }
+    default:return false;
+    }
+}
+
+bool codegen_emit_step_operation(FILE *f,const GenesisRom *rom,const M68KInstr *ins)
+{
+    if(!f || !rom || !ins || !ins->word_count)return false;
+    const WsSite *saved_sites=s_ws_sites;
+    int saved_count=s_ws_site_count;
+    bool saved_reverse=s_reverse_debug;
+    const char *saved_name=s_diag_func_name;
+    uint32_t saved_addr=s_diag_func_addr;
+    const M68KInstr *saved_ins=s_diag_instr;
+    s_ws_sites=NULL;s_ws_site_count=0;s_reverse_debug=false;
+    s_diag_func_name="<step>";s_diag_func_addr=ins->addr;s_diag_instr=ins;
+    bool handled=emit_step_control(f,rom,ins);
+    if(!handled) {
+        switch(ins->mnemonic) {
+        case MN_LSL: case MN_LSR: case MN_ASL: case MN_ASR:
+        case MN_ROL: case MN_ROR: case MN_ROXL: case MN_ROXR:
+            if(!ins->mem_shift && (ins->words[0]&32u))
+                fprintf(f,"  ctx->charge=%u+2u*(g_cpu.D[%u]&63u);\n",
+                        ins->size==M68K_SIZE_L?8u:6u,(unsigned)ins->src_ea);
+            break;
+        case MN_Scc:
+            if((ins->src_ea>>3)==0)
+                fprintf(f,"  ctx->charge=(%s)?6u:4u;\n",bcc_cond_expr((ins->words[0]>>8)&15));
+            break;
+        default:break;
+        }
+    }
+    s_ws_sites=saved_sites;s_ws_site_count=saved_count;s_reverse_debug=saved_reverse;
+    s_diag_func_name=saved_name;s_diag_func_addr=saved_addr;s_diag_instr=saved_ins;
+    if(ferror(f))return false;
+    return handled || codegen_emit_step_semantics(f,rom,ins);
+}
+
+unsigned codegen_step_nominal_cycles(const M68KInstr *ins)
+{
+    return ins && ins->word_count ? (unsigned)estimate_cycles_prm(ins) : 0;
+}
+
 static void emit_decls_preamble(FILE *f) {
     fprintf(f, "#pragma once\n");
     fprintf(f, "/* <prefix>_decls.h — AUTO-GENERATED by GenesisRecomp. DO NOT EDIT.\n");
@@ -5110,7 +4936,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             if (s_reverse_debug)
                 fprintf(f_func, "  rdb_on_insn(0x%06Xu);\n", pc);
             emit_instr(f_func, rom, &instr, &instrs, &skip_until_label, &has_sp_adjust,
-                       name, func_addr);
+                       name, func_addr, false);
 
             /* Contextual recompiler: accumulate cycles and check for
              * pending VBlank.  The runtime maintains g_cycle_accumulator

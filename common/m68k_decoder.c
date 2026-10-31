@@ -1062,6 +1062,23 @@ bool m68k_decode(const GenesisRom *rom, uint32_t addr, M68KInstr *out) {
     return true;
 }
 
+bool m68k_decode_68000(const GenesisRom *rom, uint32_t addr, M68KInstr *out) {
+    if (!rom || !out || (addr & 1u)) return false;
+    uint16_t word = rom_read16(rom, addr);
+    if ((word & 0xF0FFu) == 0x60FFu || word == 0x4E7Au || word == 0x4E7Bu) {
+        memset(out, 0, sizeof *out);
+        out->addr=addr;out->words[0]=word;out->word_count=1;out->byte_length=2;
+        out->size=M68K_SIZE_NONE;
+        if ((word & 0xF000u) == 0x6000u) {
+            unsigned cc=(word>>8)&15u;
+            out->mnemonic=cc==0?MN_BRA:cc==1?MN_BSR:MN_Bcc;
+            out->has_target=true;out->target_addr=addr+1u;
+        } else out->mnemonic=MN_ILLEGAL;
+        return true;
+    }
+    return m68k_decode(rom,addr,out);
+}
+
 bool m68k_is_terminator(const M68KInstr *instr) {
     return instr->mnemonic == MN_RTS
         || instr->mnemonic == MN_RTE

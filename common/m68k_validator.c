@@ -28,6 +28,11 @@ static bool ea_is_pc_relative(int ea) {
     return ((ea >> 3) & 7) == 7 && ((ea & 7) == 2 || (ea & 7) == 3);
 }
 
+static bool ea_is_control(int ea) {
+    unsigned mode=((unsigned)ea>>3)&7u,reg=(unsigned)ea&7u;
+    return mode==2 || mode==5 || mode==6 || (mode==7 && reg<=3);
+}
+
 M68KValidity m68k_validate(const M68KInstr *instr,
                            const M68KValidatorOptions *opts) {
     if (!instr) return M68K_LEGAL;
@@ -49,10 +54,14 @@ M68KValidity m68k_validate(const M68KInstr *instr,
          instr->mnemonic == MN_Bcc) &&
         !allow_68020) {
         uint16_t w0 = instr->words[0];
-        if ((w0 & 0xFF) == 0xFF) return M68K_ILLEGAL_NON_MC68000;
+        if ((w0 & 0xFF) == 0xFF && instr->word_count != 1)
+            return M68K_ILLEGAL_NON_MC68000;
     }
 
     switch (instr->mnemonic) {
+    case MN_JSR: case MN_JMP: case MN_LEA: case MN_PEA:
+        if (!ea_is_control(instr->src_ea)) return M68K_ILLEGAL_SRC_EA;
+        break;
     /* MOVEA is W or L only. The decoder produces MOVEA when MOVE.B
      * has An destination, which is itself illegal — surface it. */
     case MN_MOVEA:

@@ -177,5 +177,9 @@ typedef struct {
 #define PCR_IMM     4
 
 bool m68k_decode(const GenesisRom *rom, uint32_t addr, M68KInstr *out);
+/* Explicit original-MC68000 model: $6xFF has an eight-bit -1 displacement;
+ * MOVEC is a one-word illegal instruction. The legacy family decoder retains
+ * its 68020 displacement/68010 MOVEC policy for existing consumers. */
+bool m68k_decode_68000(const GenesisRom *rom, uint32_t addr, M68KInstr *out);
 bool m68k_is_terminator(const M68KInstr *instr);
 bool m68k_is_call(const M68KInstr *instr);

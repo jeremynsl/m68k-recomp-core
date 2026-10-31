@@ -11,10 +11,9 @@
  *   - code_generator can route illegal encodings to a vectored
  *     ILLEGAL trap and record a diagnostic
  *
- * Scope is strictly MC68000. Branch displacements via byte 0xFF (the
- * 32-bit displacement form) are 68020+ and are reported as
- * M68K_ILLEGAL_NON_MC68000 unless the caller opts in via
- * cfg.allow_68020_branch.
+ * Scope is strictly MC68000. Three-word branch displacements via byte 0xFF
+ * are 68020+ and are rejected unless allow_68020_branch is set. The explicit
+ * original-68000 decoder instead produces the legal one-word -1 branch.
  */
 #pragma once
 #include <stdbool.h>

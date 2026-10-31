@@ -3,6 +3,8 @@
  */
 #pragma once
 #include <stdbool.h>
+#include <stdio.h>
+#include "m68k_decoder.h"
 #include "rom_parser.h"
 #include "function_finder.h"
 #include "annotations.h"
@@ -41,3 +43,26 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
  * the heuristic-coverage exercise (diff disasm-seeded vs pure-heuristic runs
  * vs the disasm label set). NULL (default) disables the dump. */
 void codegen_set_dump_functions_path(const char *path);
+
+/* Emit one straight-line instruction's native C semantics for an explicit-PC
+ * step backend. The caller supplies CPU register/memory bindings and accounts
+ * for cycles/PC. This shares the established
+ * arithmetic/EA emitter without its function-level virtual return stack.
+ * Returns false WITHOUT output for control, privileged or exception-producing
+ * instructions; a step frontend must implement them or report a miss.
+ * No widening/game hooks are emitted. Does not change legacy codegen defaults.
+ */
+bool codegen_emit_step_semantics(FILE *out, const GenesisRom *rom,
+                                 const M68KInstr *instruction);
+
+/* MC68000 operation for runtime/m68k_step. Bind g_cpu/memory to a context
+ * parameter named `ctx`. The runtime supplies guarded instruction bytes,
+ * the next PC and initial cycle cost. This adds real guest control transfers
+ * and supervisor operations to the shared straight-line semantics. Unknown
+ * operations return false, never a no-op. */
+bool codegen_emit_step_operation(FILE *out, const GenesisRom *rom,
+                                 const M68KInstr *instruction);
+/* Initial manual-derived cost for an explicit-PC operation. Dynamic branches,
+ * shifts and conditional sets override it in the emitted operation. Multiply/
+ * divide still use documented nominal costs until independently qualified. */
+unsigned codegen_step_nominal_cycles(const M68KInstr *instruction);
