@@ -2117,6 +2117,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             function_finder_pops_return_unconditionally(rom, instr->target_addr)) {
             fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push (callee captures return) */\n",
                     ret_addr);
+            emit_cycle_accounting(f, "  ", estimate_cycles(instr));
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
             if (func_is_known(instr->target_addr))
                 fprintf(f, "    recomp_call_func(func_%06X);\n", instr->target_addr);
@@ -2125,7 +2126,6 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             fprintf(f, "    g_split_sp_popped = _saved_split_sp_popped;\n");
             fprintf(f, "  }\n");
             fprintf(f, "  g_rte_pending = 0; /* callee captured our return; handled here */\n");
-            emit_cycle_accounting(f, "  ", estimate_cycles(instr));
             fprintf(f, "  return; /* callee captured return addr: no pop, no fall-through */\n");
             *skip_until_label = true;
             break;
@@ -2137,6 +2137,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "  uint32_t _jsr_pre_sp_%06X = g_cpu.A[7];\n", addr);
         fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push */\n", ret_addr);
         fprintf(f, "  uint32_t _jsr_slot_sp_%06X = g_cpu.A[7];\n", addr);
+        emit_cycle_accounting(f, "  ", estimate_cycles(instr));
 
         if (instr->has_target) {
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
@@ -2196,7 +2197,6 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * pop keeps A7 in sync with hardware. Consume one skipped return
          * slot; additional skipped slots continue through outer callers. */
         fprintf(f, "  if (g_rte_pending) { --g_rte_pending;\n");
-        emit_cycle_accounting(f, "    ", estimate_cycles(instr));
         fprintf(f, "    return; } /* RTE/skip propagation (pre-pop) */\n");
         fprintf(f,
                 "  if (g_cpu.A[7] != (uint32_t)(_jsr_slot_sp_%06X + 4u))\n"
@@ -4928,7 +4928,8 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * matching the interpreter's interrupt-driven behavior. */
             {
                 int cyc = estimate_cycles(&instr);
-                emit_cycle_accounting(f_func, "  ", cyc);
+                if (instr.mnemonic != MN_BSR && instr.mnemonic != MN_JSR)
+                    emit_cycle_accounting(f_func, "  ", cyc);
             }
 
             /* Two valid entry streams can overlap in ROM. Sorted emission
